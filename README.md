@@ -11,6 +11,8 @@ agente-langchain/
 ├── .gitignore           # diz ao git o que ignorar
 ├── requirements.txt    # dependencias travadas (saida de pip freeze)
 ├── agente.py           # codigo do agente (explicado linha a linha abaixo)
+├── api.py              # API FastAPI que expoe o agente via HTTP (ver secao "Frontend web")
+├── static/              # frontend estatico (HTML/CSS/JS) do chat
 └── README.md           # este arquivo
 ```
 
@@ -341,12 +343,51 @@ Se o usuario so apertou Enter (linha vazia/so espacos), pula pra proxima iteraca
 ```
 Chama o agente passando o `historico` atual e a pergunta digitada. `executar_agente` devolve o texto da resposta e o `historico` **atualizado**, que sobrescreve a variavel `historico` — e assim que a memoria persiste de um turno pro outro. Volta pro topo do `while True` e espera a proxima pergunta, agora com mais contexto disponivel.
 
+## Frontend web (API + chat)
+
+Alem do loop de terminal, o projeto tem uma API HTTP (`api.py`, FastAPI) e um
+frontend estatico (`static/`) que conversam com o mesmo `executar_agente`.
+
+```
+agente-langchain/
+├── api.py              # FastAPI: POST /chat, DELETE /chat/{id}, serve static/
+└── static/
+    ├── index.html       # markup da tela de chat
+    ├── style.css        # design tokens + estilos (tema claro/escuro automatico)
+    └── app.js           # fetch para /chat, memoria de session_id no localStorage
+```
+
+Rodando:
+
+```bash
+source .venv/bin/activate
+uvicorn api:app --reload
+```
+
+Abra `http://127.0.0.1:8000/`. Cada aba/navegador guarda um `session_id`
+proprio no `localStorage`; o backend mantem o historico daquela sessao em
+memoria (`SESSOES`, dict em `api.py`) enquanto o processo do uvicorn estiver
+rodando — reiniciar o servidor zera todas as conversas (mesma limitacao
+consciente do `historico` do loop de terminal: nada e truncado, nada e
+persistido em disco).
+
+Endpoints:
+
+| Metodo | Rota | Uso |
+|---|---|---|
+| `POST` | `/chat` | Body `{"mensagem": "...", "session_id": "..."}` (`session_id` opcional na primeira mensagem). Retorna `{"resposta": "...", "session_id": "..."}`. |
+| `DELETE` | `/chat/{session_id}` | Apaga o historico daquela sessao (usado pelo botao "Nova conversa"). |
+| `GET` | `/` | Serve `static/index.html`. |
+
+O `app.js` renderiza as mensagens com `textContent` (nao `innerHTML`), pra nao
+correr risco de XSS caso o modelo ou o usuario devolva texto com HTML/script.
+
 ## Extensoes possiveis
 
 - Trocar o modelo (`model=`) por outro disponivel na sua conta OpenAI.
 - Adicionar novas tools com o decorator `@tool` (ex: consulta de status do cartao).
-- Expor o agente via FastAPI (`uvicorn` ja instalado) criando um endpoint que chama `executar_agente(pergunta)`.
 - Usar `langchain-anthropic` no lugar de `langchain-openai` caso troque de provedor (Claude/Anthropic).
+- Trocar o dict `SESSOES` em memoria por Redis/banco se precisar persistir entre reinicios do servidor.
 
 ## Seguranca
 
