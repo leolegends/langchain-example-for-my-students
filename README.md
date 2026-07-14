@@ -1,17 +1,26 @@
 # agente-langchain
 
-Agente de suporte do AcmePass (produto ficticio, uso didatico) com LangChain + OpenAI. Responde apenas com base numa FAQ fixa no system prompt e numa tool de consulta de CEP (ViaCEP); fora disso, recusa e encaminha para atendimento humano.
+Material didatico: agente de suporte do **AcmePass** (produto ficticio, so pra treinamento) feito com **LangChain** + **OpenAI**. O agente responde apenas com base numa FAQ fixa e numa tool de consulta de CEP; fora disso, ele recusa e encaminha pra um humano. Este README explica **cada linha** de `agente.py`, pra quem esta aprendendo LangChain do zero.
 
-## Estrutura
+## Estrutura do projeto
 
 ```
 agente-langchain/
 ├── .venv/              # ambiente virtual Python (nao versionar)
-├── .env                # OPENAI_API_KEY (nao versionar)
-├── .gitignore
-├── requirements.txt    # dependencias travadas (pip freeze)
-└── agente.py           # codigo do agente
+├── .env                # guarda OPENAI_API_KEY (nao versionar)
+├── .gitignore           # diz ao git o que ignorar
+├── requirements.txt    # dependencias travadas (saida de pip freeze)
+├── agente.py           # codigo do agente (explicado linha a linha abaixo)
+└── README.md           # este arquivo
 ```
+
+## Conceitos antes de ler o codigo
+
+- **LLM (Large Language Model)**: o modelo de linguagem (aqui, `gpt-4o-mini` da OpenAI) que gera texto a partir de um prompt.
+- **System prompt**: instrucao fixa, invisivel pro usuario final, que define o comportamento/persona/regras do modelo.
+- **Tool (ferramenta)**: uma funcao Python comum que o modelo pode "pedir" pra executar (tool calling / function calling). O modelo NAO executa a funcao — ele so decide qual chamar e com quais argumentos; quem executa e o seu codigo.
+- **Tool calling / function calling**: mecanismo onde o modelo devolve uma resposta estruturada dizendo "quero chamar a funcao X com esses argumentos", em vez de so texto livre.
+- **Agente**: um LLM + tools + um loop que decide quando chamar tool e quando responder direto.
 
 ## Setup
 
@@ -24,9 +33,17 @@ pip install langchain langchain-openai \
             requests fastapi uvicorn python-dotenv
 ```
 
-## Configuracao da chave
+O que cada pacote faz:
 
-Crie o `.env` na raiz do projeto (ja gitignorado):
+| Pacote | Para que serve aqui |
+|---|---|
+| `langchain` | framework base de orquestracao de LLM (mensagens, tools, etc.) |
+| `langchain-openai` | integracao especifica da LangChain com os modelos da OpenAI (`ChatOpenAI`) |
+| `requests` | cliente HTTP usado pela tool `consultar_cep` pra chamar a API ViaCEP |
+| `fastapi` / `uvicorn` | instalados para uma extensao futura (expor o agente como API web); nao usados no `agente.py` atual |
+| `python-dotenv` | le variaveis de um arquivo `.env` e injeta no ambiente do processo (`load_dotenv`) |
+
+## Configuracao da chave
 
 ```bash
 echo "OPENAI_API_KEY=sua_chave" > .env
@@ -55,14 +72,252 @@ Resposta: Não tenho essa informação. Vou te encaminhar para um atendente huma
 Encerrado.
 ```
 
-## Como funciona
+## `agente.py` explicado linha a linha
 
-1. `load_dotenv()` le o `.env` e injeta `OPENAI_API_KEY` no ambiente do processo.
-2. `SYSTEM_PROMPT` fixa o escopo do agente: responder so com base na FAQ e na tool `consultar_cep`, recusar o resto, nunca pedir dado sensivel.
-3. `ChatOpenAI(model="gpt-4o-mini")` instancia o modelo da OpenAI usado pelo agente.
-4. `llm.bind_tools([consultar_cep])` informa ao modelo que ele pode pedir a consulta de CEP.
-5. `consultar_cep` valida o CEP (8 digitos) e chama a API publica ViaCEP (`https://viacep.com.br`), com timeout e tratamento de erro de rede/CEP invalido.
-6. `executar_agente()` implementa o loop: envia a pergunta, verifica se o modelo pediu a tool call, executa `consultar_cep`, devolve o resultado ao modelo e retorna a resposta final.
+### Imports (linhas 1-10)
+
+```python
+"""Agente de suporte AcmePass (ficticio) com LangChain + OpenAI."""
+```
+Docstring do modulo — descreve o que o arquivo faz. Nao afeta a execucao.
+
+```python
+import os
+import re
+```
+- `os`: usado pra ler variavel de ambiente (`os.getenv`).
+- `re`: usado pra limpar o CEP com regex (remover tudo que nao for digito).
+
+```python
+import requests
+```
+Biblioteca HTTP. Usada dentro de `consultar_cep` pra chamar a API ViaCEP.
+
+```python
+from dotenv import load_dotenv
+```
+Funcao que le o arquivo `.env` da pasta atual e injeta as variaveis no ambiente do processo (equivalente a fazer `export VAR=valor` no shell, mas via codigo).
+
+```python
+from langchain_openai import ChatOpenAI
+```
+Classe da LangChain que encapsula a chamada ao modelo de chat da OpenAI (`gpt-4o-mini`, `gpt-4o`, etc.).
+
+```python
+from langchain_core.messages import HumanMessage, SystemMessage
+```
+Tipos de mensagem do "protocolo de chat" da LangChain:
+- `SystemMessage`: instrucao de sistema (regras/persona do agente).
+- `HumanMessage`: mensagem do usuario.
+
+```python
+from langchain_core.tools import tool
+```
+Decorator `@tool`, que transforma uma funcao Python comum numa "tool" que o LLM consegue enxergar e pedir pra chamar.
+
+### Carregamento e validacao da chave (linhas 12-17)
+
+```python
+# carrega variaveis do .env (OPENAI_API_KEY) para o ambiente do processo
+load_dotenv()
+```
+Executa a leitura do `.env`. A partir daqui, `os.getenv("OPENAI_API_KEY")` enxerga o valor.
+
+```python
+if not os.getenv("OPENAI_API_KEY"):
+    # falha rapido se a chave nao estiver configurada
+    raise RuntimeError("OPENAI_API_KEY nao encontrada. Configure o arquivo .env.")
+```
+Validacao de boundary: se a chave nao existir, o programa para imediatamente com erro claro, em vez de falhar depois, no meio de uma chamada a API, com um erro confuso.
+
+### System prompt (linhas 19-41)
+
+```python
+SYSTEM_PROMPT = """
+Você é o assistente de suporte do AcmePass
+...
+"""
+```
+String multi-linha com as instrucoes fixas do agente: escopo (FAQ + tool de CEP), regra anti-alucinacao (se nao souber, recusa e encaminha pra humano) e regra de protecao de dados sensiveis (nunca pedir CPF, cartao, senha, dados de saude). Essa string vira o conteudo de um `SystemMessage`, enviado em toda chamada ao modelo — e o que da o "carater" e os limites do agente.
+
+### Constante de timeout (linha 43)
+
+```python
+CEP_TIMEOUT_SEGUNDOS = 5
+```
+Numero magico nomeado: tempo maximo (em segundos) que a chamada HTTP pra ViaCEP pode esperar antes de desistir. Evita que o agente trave para sempre se a API externa nao responder.
+
+### Tool `consultar_cep` (linhas 46-71)
+
+```python
+@tool
+def consultar_cep(cep: str) -> str:
+    """Consulta endereco a partir de um CEP brasileiro (formato 00000000 ou 00000-000)."""
+```
+O decorator `@tool` registra essa funcao como tool. A **docstring** aqui nao e so documentacao: e o texto que o LLM le para decidir se/quando chamar essa funcao. Escreva a docstring pensando em "isso vai ser lido pelo modelo, nao so por humanos".
+
+```python
+    cep_limpo = re.sub(r"\D", "", cep)
+```
+Remove qualquer caractere que nao seja digito (`\D` = "nao-digito"). Assim `"01310-100"` e `"01310100"` viram a mesma coisa.
+
+```python
+    # valida na borda: CEP brasileiro tem exatamente 8 digitos
+    if len(cep_limpo) != 8:
+        return "CEP invalido. Informe um CEP com 8 digitos."
+```
+Validacao de entrada (boundary check). CEP brasileiro sempre tem 8 digitos; se nao tiver, retorna erro amigavel sem nem chamar a API.
+
+```python
+    try:
+        resposta = requests.get(
+            f"https://viacep.com.br/ws/{cep_limpo}/json/",
+            timeout=CEP_TIMEOUT_SEGUNDOS,
+        )
+        resposta.raise_for_status()
+    except requests.RequestException:
+        return "Nao foi possivel consultar o CEP agora. Tente novamente mais tarde."
+```
+Chama a API publica **ViaCEP** (`viacep.com.br`), que devolve um JSON com o endereco daquele CEP.
+- `timeout=CEP_TIMEOUT_SEGUNDOS`: nao deixa a chamada pendurar indefinidamente.
+- `raise_for_status()`: lanca excecao se o HTTP retornar codigo de erro (4xx/5xx).
+- `except requests.RequestException`: captura qualquer erro de rede/timeout/HTTP e devolve mensagem amigavel, em vez de estourar stacktrace pro usuario final.
+
+```python
+    dados = resposta.json()
+    if dados.get("erro"):
+        return "CEP nao encontrado."
+```
+Converte o corpo da resposta em dict Python. A API ViaCEP retorna `{"erro": true}` quando o CEP e valido no formato mas nao existe — tratamos esse caso separado do erro de rede.
+
+```python
+    return (
+        f"{dados.get('logradouro', '')}, {dados.get('bairro', '')}, "
+        f"{dados.get('localidade', '')}/{dados.get('uf', '')}"
+    )
+```
+Monta a string final do endereco (rua, bairro, cidade/UF). `dados.get(chave, '')` evita erro se algum campo vier ausente no JSON.
+
+### Instancia do modelo e das tools (linhas 74-80)
+
+```python
+# modelo da OpenAI usado pelo agente. troque o nome do modelo conforme sua conta/plano
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+```
+Cria o cliente do modelo de chat.
+- `model="gpt-4o-mini"`: modelo escolhido (mais barato/rapido; pode trocar por `gpt-4o`, etc., conforme acesso da sua conta).
+- `temperature=0`: reduz aleatoriedade da resposta — bom pra um agente de suporte, que deve ser consistente, nao criativo.
+
+```python
+# vincula as tools ao modelo para permitir tool-calling
+llm_com_tools = llm.bind_tools([consultar_cep])
+```
+`bind_tools` cria uma nova versao do LLM que "conhece" a tool `consultar_cep` — o modelo passa a poder responder pedindo a chamada dessa funcao.
+
+```python
+TOOLS_POR_NOME = {"consultar_cep": consultar_cep}
+```
+Dicionario que mapeia o nome da tool (string que o modelo devolve) pra funcao Python real. Usado depois para executar a chamada.
+
+### Funcao `executar_agente` (linhas 83-110)
+
+```python
+def executar_agente(pergunta: str) -> str:
+    """Loop simples: pergunta -> modelo decide se usa tool -> aplica tool -> resposta final."""
+    mensagens = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=pergunta),
+    ]
+```
+Monta o historico de mensagens que vai pro modelo: primeiro o system prompt (regras fixas), depois a pergunta do usuario.
+
+```python
+    resposta = llm_com_tools.invoke(mensagens)
+    mensagens.append(resposta)
+```
+`invoke` manda as mensagens pro modelo e recebe a resposta. Essa resposta e adicionada de volta ao historico (`mensagens`) — necessario pra segunda chamada, caso o modelo peca uma tool.
+
+```python
+    # se o modelo pediu para chamar alguma tool, executa e devolve o resultado pra ele
+    for chamada in resposta.tool_calls or []:
+```
+`resposta.tool_calls` e uma lista (pode vir vazia/`None`) com as tools que o modelo pediu pra chamar, cada uma com nome e argumentos. O `or []` evita erro se vier `None`.
+
+```python
+        tool_fn = TOOLS_POR_NOME[chamada["name"]]
+        resultado = tool_fn.invoke(chamada["args"])
+```
+Busca a funcao real pelo nome que o modelo pediu, e executa com os argumentos que o modelo gerou (ex: `{"cep": "01310-100"}`).
+
+```python
+        mensagens.append(
+            {
+                "role": "tool",
+                "content": str(resultado),
+                "tool_call_id": chamada["id"],
+            }
+        )
+```
+Adiciona o resultado da tool de volta ao historico, como uma mensagem de "role: tool" — assim o modelo, na proxima chamada, ve o resultado e pode usa-lo pra montar a resposta final. `tool_call_id` amarra essa resposta a chamada especifica que o modelo pediu.
+
+```python
+    if resposta.tool_calls:
+        # pede resposta final ao modelo, agora com o resultado da tool no contexto
+        resposta_final = llm_com_tools.invoke(mensagens)
+        return resposta_final.content
+```
+Se alguma tool foi chamada, faz uma segunda chamada ao modelo — agora com o resultado da tool no historico — pra ele gerar a resposta final em linguagem natural.
+
+```python
+    return resposta.content
+```
+Se o modelo NAO pediu nenhuma tool, a resposta original ja e a resposta final (ex: perguntas de FAQ, que nao precisam de CEP).
+
+### Loop principal (linhas 113-130)
+
+```python
+if __name__ == "__main__":
+```
+So executa o bloco abaixo quando o arquivo roda diretamente (`python agente.py`), nao quando e importado por outro modulo.
+
+```python
+    print("Agente AcmePass pronto. Digite sua pergunta (CTRL+C para sair).")
+    while True:
+```
+Mensagem inicial e loop infinito — o agente fica esperando perguntas ate ser interrompido.
+
+```python
+        try:
+            pergunta = input("> ")
+```
+`input("> ")` mostra o prompt `> ` e bloqueia esperando o usuario digitar e apertar Enter.
+
+```python
+        except KeyboardInterrupt:
+            # CTRL+C: encerra sem stacktrace
+            print("\nEncerrado.")
+            break
+```
+`CTRL+C` gera `KeyboardInterrupt` em Python. Sem esse `try/except`, o programa terminaria mostrando um stacktrace feio; aqui ele encerra com mensagem limpa.
+
+```python
+        except EOFError:
+            # stdin fechado (ex: pipe acabou): encerra sem stacktrace
+            print("\nEncerrado (EOF).")
+            break
+```
+`EOFError` acontece quando o `stdin` fecha (ex: rodando via pipe `echo "pergunta" | python agente.py`, ou `CTRL+D` no terminal). Tratado do mesmo jeito, pra nao quebrar feio.
+
+```python
+        if not pergunta.strip():
+            continue
+```
+Se o usuario so apertou Enter (linha vazia/so espacos), pula pra proxima iteracao sem chamar o modelo — evita gastar uma chamada de API a toa.
+
+```python
+        print(f"Resposta: {executar_agente(pergunta)}")
+```
+Chama o agente com a pergunta digitada e imprime a resposta. Volta pro topo do `while True` e espera a proxima pergunta.
 
 ## Extensoes possiveis
 
@@ -76,3 +331,4 @@ Encerrado.
 - `.env` fica fora do controle de versao (`.gitignore`).
 - Nunca commitar chaves de API.
 - Validar `OPENAI_API_KEY` no startup (ja feito em `agente.py`) evita falha silenciosa.
+- O `SYSTEM_PROMPT` proibe explicitamente pedir dados sensiveis (CPF, cartao, senha, saude) — mas isso e uma instrucao pro modelo, nao uma garantia tecnica. Nao trate como controle de seguranca suficiente sozinho; se este agente evoluir pra lidar com dados reais de usuarios, validacao e sanitizacao devem acontecer no codigo, nao so no prompt.
