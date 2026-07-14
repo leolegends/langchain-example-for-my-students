@@ -2,11 +2,12 @@
 
 import os
 import re
+from typing import List
 
 import requests
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 
 # carrega variaveis do .env (OPENAI_API_KEY) para o ambiente do processo
@@ -83,38 +84,46 @@ llm_com_tools = llm.bind_tools([consultar_cep])
 TOOLS_POR_NOME = {"consultar_cep": consultar_cep}
 
 
-def executar_agente(pergunta: str) -> str:
-    """Loop simples: pergunta -> modelo decide se usa tool -> aplica tool -> resposta final."""
-    mensagens = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=pergunta),
-    ]
+def executar_agente(
+    historico: List[AnyMessage], pergunta: str
+) -> tuple[str, List[AnyMessage]]:
+    """Pergunta -> modelo decide se usa tool -> aplica tool -> resposta final.
+
+    Recebe o historico da conversa (memoria) e devolve um NOVO historico
+    com o turno atual anexado, sem mutar a lista recebida.
+    """
+    mensagens = historico + [HumanMessage(content=pergunta)]
 
     resposta = llm_com_tools.invoke(mensagens)
-    mensagens.append(resposta)
+    mensagens = mensagens + [resposta]
 
     # se o modelo pediu para chamar alguma tool, executa e devolve o resultado pra ele
     for chamada in resposta.tool_calls or []:
         tool_fn = TOOLS_POR_NOME[chamada["name"]]
         resultado = tool_fn.invoke(chamada["args"])
-        mensagens.append(
+        mensagens = mensagens + [
             {
                 "role": "tool",
                 "content": str(resultado),
                 "tool_call_id": chamada["id"],
             }
-        )
+        ]
 
     if resposta.tool_calls:
         # pede resposta final ao modelo, agora com o resultado da tool no contexto
         resposta_final = llm_com_tools.invoke(mensagens)
-        return resposta_final.content
+        mensagens = mensagens + [resposta_final]
+        return resposta_final.content, mensagens
 
-    return resposta.content
+    return resposta.content, mensagens
 
 
 if __name__ == "__main__":
     print("Agente AcmePass pronto. Digite sua pergunta (CTRL+C para sair).")
+
+    # memoria da conversa: comeca so com o system prompt e cresce a cada turno
+    historico: List[AnyMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
+
     while True:
         try:
             pergunta = input("> ")
@@ -130,4 +139,5 @@ if __name__ == "__main__":
         if not pergunta.strip():
             continue
 
-        print(f"Resposta: {executar_agente(pergunta)}")
+        texto_resposta, historico = executar_agente(historico, pergunta)
+        print(f"Resposta: {texto_resposta}")

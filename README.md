@@ -84,9 +84,11 @@ Docstring do modulo — descreve o que o arquivo faz. Nao afeta a execucao.
 ```python
 import os
 import re
+from typing import List
 ```
 - `os`: usado pra ler variavel de ambiente (`os.getenv`).
 - `re`: usado pra limpar o CEP com regex (remover tudo que nao for digito).
+- `List`: type hint pra listas (usado no tipo do historico de mensagens).
 
 ```python
 import requests
@@ -104,11 +106,12 @@ from langchain_openai import ChatOpenAI
 Classe da LangChain que encapsula a chamada ao modelo de chat da OpenAI (`gpt-4o-mini`, `gpt-4o`, etc.).
 
 ```python
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage
 ```
 Tipos de mensagem do "protocolo de chat" da LangChain:
 - `SystemMessage`: instrucao de sistema (regras/persona do agente).
 - `HumanMessage`: mensagem do usuario.
+- `AnyMessage`: tipo "uniao" que representa qualquer tipo de mensagem (system, human, tool, resposta do modelo etc.) — usado so como type hint pra tipar a lista `historico`.
 
 ```python
 from langchain_core.tools import tool
@@ -221,23 +224,30 @@ TOOLS_POR_NOME = {"consultar_cep": consultar_cep}
 ```
 Dicionario que mapeia o nome da tool (string que o modelo devolve) pra funcao Python real. Usado depois para executar a chamada.
 
-### Funcao `executar_agente` (linhas 83-110)
+### Funcao `executar_agente` — com memoria de conversa
 
 ```python
-def executar_agente(pergunta: str) -> str:
-    """Loop simples: pergunta -> modelo decide se usa tool -> aplica tool -> resposta final."""
-    mensagens = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=pergunta),
-    ]
+def executar_agente(
+    historico: List[AnyMessage], pergunta: str
+) -> tuple[str, List[AnyMessage]]:
+    """Pergunta -> modelo decide se usa tool -> aplica tool -> resposta final.
+
+    Recebe o historico da conversa (memoria) e devolve um NOVO historico
+    com o turno atual anexado, sem mutar a lista recebida.
+    """
 ```
-Monta o historico de mensagens que vai pro modelo: primeiro o system prompt (regras fixas), depois a pergunta do usuario.
+A funcao recebe o `historico` (lista de mensagens dos turnos anteriores — a "memoria" do agente) e a `pergunta` nova. Ela devolve uma tupla: `(texto_da_resposta, historico_atualizado)`. Note que ela **nao muta** a lista recebida — sempre cria uma lista nova com `+`. Isso segue o principio de imutabilidade: evita efeitos colaterais escondidos (se outro pedaço de codigo ainda tiver referencia ao `historico` antigo, ele continua intacto).
+
+```python
+    mensagens = historico + [HumanMessage(content=pergunta)]
+```
+Cria uma nova lista: tudo que ja aconteceu na conversa (`historico`) + a pergunta nova. Isso e a "memoria" na pratica — o modelo recebe as trocas anteriores junto da pergunta atual.
 
 ```python
     resposta = llm_com_tools.invoke(mensagens)
-    mensagens.append(resposta)
+    mensagens = mensagens + [resposta]
 ```
-`invoke` manda as mensagens pro modelo e recebe a resposta. Essa resposta e adicionada de volta ao historico (`mensagens`) — necessario pra segunda chamada, caso o modelo peca uma tool.
+Manda tudo pro modelo. A resposta e anexada (numa lista nova, nao com `.append`) pro caso de precisar de uma segunda chamada (quando o modelo pediu tool).
 
 ```python
     # se o modelo pediu para chamar alguma tool, executa e devolve o resultado pra ele
@@ -252,30 +262,35 @@ Monta o historico de mensagens que vai pro modelo: primeiro o system prompt (reg
 Busca a funcao real pelo nome que o modelo pediu, e executa com os argumentos que o modelo gerou (ex: `{"cep": "01310-100"}`).
 
 ```python
-        mensagens.append(
+        mensagens = mensagens + [
             {
                 "role": "tool",
                 "content": str(resultado),
                 "tool_call_id": chamada["id"],
             }
-        )
+        ]
 ```
-Adiciona o resultado da tool de volta ao historico, como uma mensagem de "role: tool" — assim o modelo, na proxima chamada, ve o resultado e pode usa-lo pra montar a resposta final. `tool_call_id` amarra essa resposta a chamada especifica que o modelo pediu.
+Anexa o resultado da tool ao historico (lista nova de novo), como mensagem de "role: tool" — assim o modelo, na proxima chamada, ve o resultado e pode usa-lo pra montar a resposta final. `tool_call_id` amarra essa resposta a chamada especifica que o modelo pediu.
 
 ```python
     if resposta.tool_calls:
         # pede resposta final ao modelo, agora com o resultado da tool no contexto
         resposta_final = llm_com_tools.invoke(mensagens)
-        return resposta_final.content
+        mensagens = mensagens + [resposta_final]
+        return resposta_final.content, mensagens
 ```
-Se alguma tool foi chamada, faz uma segunda chamada ao modelo — agora com o resultado da tool no historico — pra ele gerar a resposta final em linguagem natural.
+Se alguma tool foi chamada, faz uma segunda chamada ao modelo — agora com o resultado da tool no historico — pra ele gerar a resposta final. O historico final (com a resposta da tool E a resposta final) e devolvido, pra alimentar o proximo turno.
 
 ```python
-    return resposta.content
+    return resposta.content, mensagens
 ```
-Se o modelo NAO pediu nenhuma tool, a resposta original ja e a resposta final (ex: perguntas de FAQ, que nao precisam de CEP).
+Se o modelo NAO pediu nenhuma tool, a resposta original ja e a resposta final (ex: perguntas de FAQ). O `mensagens` devolvido aqui ja inclui essa resposta — mantendo a memoria consistente mesmo quando nenhuma tool foi usada.
 
-### Loop principal (linhas 113-130)
+**Por que isso e "memoria"?** Sem isso, cada `executar_agente` comecava do zero (so `SystemMessage` + a pergunta atual) — o modelo nao via nada do que foi dito antes. Um sintoma real desse bug: perguntar "voce consegue consultar meu CEP?" (sem o numero) fazia o agente pedir o CEP, mas se o usuario respondesse so o numero no proximo turno, o agente nao lembrava que aquilo era resposta a propria pergunta dele — cada turno era uma conversa nova. Com o historico passado adiante, o modelo agora ve a conversa inteira a cada chamada.
+
+**Limitacao consciente:** o historico cresce sem limite. Numa conversa muito longa, isso aumenta o custo (tokens) e pode eventualmente estourar o limite de contexto do modelo. Para este material didatico isso nao foi tratado (YAGNI) — numa aplicacao real, valeria truncar ou resumir o historico mais antigo periodicamente.
+
+### Loop principal — mantendo a memoria entre turnos
 
 ```python
 if __name__ == "__main__":
@@ -284,9 +299,13 @@ So executa o bloco abaixo quando o arquivo roda diretamente (`python agente.py`)
 
 ```python
     print("Agente AcmePass pronto. Digite sua pergunta (CTRL+C para sair).")
+
+    # memoria da conversa: comeca so com o system prompt e cresce a cada turno
+    historico: List[AnyMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
+
     while True:
 ```
-Mensagem inicial e loop infinito — o agente fica esperando perguntas ate ser interrompido.
+Mensagem inicial e criacao do `historico` — a variavel que guarda a memoria da conversa. Comeca so com o `SystemMessage` (as regras fixas); a cada turno, `executar_agente` devolve um `historico` maior, que e reatribuido aqui fora do loop (por isso a variavel `historico` precisa existir antes do `while True`, nao dentro dele).
 
 ```python
         try:
@@ -317,9 +336,10 @@ Mensagem inicial e loop infinito — o agente fica esperando perguntas ate ser i
 Se o usuario so apertou Enter (linha vazia/so espacos), pula pra proxima iteracao sem chamar o modelo — evita gastar uma chamada de API a toa.
 
 ```python
-        print(f"Resposta: {executar_agente(pergunta)}")
+        texto_resposta, historico = executar_agente(historico, pergunta)
+        print(f"Resposta: {texto_resposta}")
 ```
-Chama o agente com a pergunta digitada e imprime a resposta. Volta pro topo do `while True` e espera a proxima pergunta.
+Chama o agente passando o `historico` atual e a pergunta digitada. `executar_agente` devolve o texto da resposta e o `historico` **atualizado**, que sobrescreve a variavel `historico` — e assim que a memoria persiste de um turno pro outro. Volta pro topo do `while True` e espera a proxima pergunta, agora com mais contexto disponivel.
 
 ## Extensoes possiveis
 
