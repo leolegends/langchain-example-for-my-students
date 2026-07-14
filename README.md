@@ -138,7 +138,9 @@ Você é o assistente de suporte do AcmePass
 ...
 """
 ```
-String multi-linha com as instrucoes fixas do agente: escopo (FAQ + tool de CEP), regra anti-alucinacao (se nao souber, recusa e encaminha pra humano) e regra de protecao de dados sensiveis (nunca pedir CPF, cartao, senha, dados de saude). Essa string vira o conteudo de um `SystemMessage`, enviado em toda chamada ao modelo — e o que da o "carater" e os limites do agente.
+String multi-linha com as instrucoes fixas do agente: escopo (FAQ + tool de CEP), regra de esclarecimento (se o usuario quer consultar CEP mas nao deu o numero, perguntar o numero em vez de recusar), regra anti-alucinacao (se nao souber, recusa e encaminha pra humano) e regra de protecao de dados sensiveis (nunca pedir CPF, cartao, senha, dados de saude). Essa string vira o conteudo de um `SystemMessage`, enviado em toda chamada ao modelo — e o que da o "carater" e os limites do agente.
+
+**Licao pratica:** na primeira versao, a regra 3 (recusar o que fugir da FAQ/tool) nao existia separada da regra de "perguntar o CEP" — resultado: perguntar "voce consegue consultar meu CEP?" (sem informar o numero) fazia o modelo cair direto na regra de recusa, porque nao havia CEP pra passar pra tool. O ajuste foi explicitar no prompt: "se a intencao e consultar CEP mas falta o numero, pergunte o numero, nao recuse". Isso mostra que o `SYSTEM_PROMPT` precisa cobrir nao so "o que responder" mas tambem "o que fazer quando falta informacao pra usar a tool".
 
 ### Constante de timeout (linha 43)
 
